@@ -276,36 +276,43 @@ class F1ReplayWindow(arcade.Window):
                                 self.driver_finished_status[code] = True
                                 self.driver_finish_order[code] = int(self.frame_index)
 
-        # 2d. Use official API classification positions
+        # 2d. Use official API classification positions (only after race finishes)
         if self.race_finished and not self.final_positions:
-            # Use the official classification from the API (already accounts for penalties)
-            # Only compute this once when race finishes
-            temp_classification = []
+            # Use the official classification from the API directly
+            # Build a list to sort: finished drivers by their position, DNF drivers by laps
+            classification_list = []
             for code in frame["drivers"].keys():
                 driver_info = self.driver_status.get(code, {})
                 api_classification = driver_info.get('classification', 99)
                 laps_completed = driver_info.get('laps_completed', 0)
 
-                # Convert classification to sortable value
                 if isinstance(api_classification, int):
+                    # Finished driver - use their official position
                     sort_key = api_classification
+                    is_classified = True
                 else:
-                    # DNF drivers - sort after all finishers by laps completed (descending)
+                    # DNF driver - sort after all finished drivers by laps (descending)
                     sort_key = 1000 - laps_completed
+                    is_classified = False
 
-                temp_classification.append({
+                classification_list.append({
                     'code': code,
-                    'position': api_classification if isinstance(api_classification, int) else api_classification,
-                    'sort_key': sort_key
+                    'sort_key': sort_key,
+                    'official_position': api_classification if is_classified else None
                 })
 
-            # Sort by sort_key to get final order
-            temp_classification.sort(key=lambda x: x['sort_key'])
+            # Sort: finished drivers first by position, then DNF drivers by laps
+            classification_list.sort(key=lambda x: x['sort_key'])
 
-            # Assign display positions (1, 2, 3, ... 20)
+            # Assign final display positions
             self.final_positions = {}
-            for idx, driver_data in enumerate(temp_classification):
-                self.final_positions[driver_data['code']] = idx + 1
+            for idx, driver in enumerate(classification_list):
+                # Use official position if they have one, otherwise use sequential position
+                if driver['official_position'] is not None:
+                    self.final_positions[driver['code']] = driver['official_position']
+                else:
+                    # DNF driver - use their position in the sorted list (after all finishers)
+                    self.final_positions[driver['code']] = idx + 1
         # 3. Track Status and Drawing
         current_time = frame["t"]
         current_track_status = "GREEN"
