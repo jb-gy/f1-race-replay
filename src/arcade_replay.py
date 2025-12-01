@@ -191,7 +191,9 @@ class F1ReplayWindow(arcade.Window):
         idx = min(int(self.frame_index), self.n_frames - 1)
         frame = self.frames[idx]
 
-        # 2a. Update distance caches and detect DNF/finish status
+        # 2a. HYBRID APPROACH: Use API data for accuracy + distance deltas for timing
+
+        # Update distance caches for all drivers
         for code, pos in frame["drivers"].items():
             current_dist = pos.get("dist", 0)
 
@@ -204,55 +206,79 @@ class F1ReplayWindow(arcade.Window):
             if len(self.driver_dist_cache[code]) > 10:
                 self.driver_dist_cache[code].pop(0)
 
-            # DNF Detection: All 10 values the same = driver stopped
-            if len(self.driver_dist_cache[code]) == 10:
-                dist_values = self.driver_dist_cache[code]
-                # Check if all values are identical (within 1 meter tolerance)
-                if all(abs(d - dist_values[0]) < 1.0 for d in dist_values):
-                    # Only mark as DNF if not already finished
-                    if code not in self.driver_finished_status or not self.driver_finished_status[code]:
+        # Get driver info from API (if available)
+        has_api_data = bool(self.driver_status)
+
+        # DNF Detection (Hybrid):
+        # - API tells us WHO will DNF
+        # - Distance delta tells us WHEN their car stopped
+        for code, pos in frame["drivers"].items():
+            driver_info = self.driver_status.get(code, {})
+            is_dnf_per_api = driver_info.get('is_dnf', False)
+
+            # Only check distance for drivers the API says will DNF
+            if is_dnf_per_api and code not in self.driver_dnf_status:
+                if len(self.driver_dist_cache[code]) == 10:
+                    dist_values = self.driver_dist_cache[code]
+                    # Check if stopped moving (all 10 values within 1 meter)
+                    if all(abs(d - dist_values[0]) < 1.0 for d in dist_values):
                         self.driver_dnf_status[code] = True
 
-        # 2b. Race finish detection: Leader's dist stops increasing for 2+ frames
+        # 2b. Race finish detection (Hybrid):
+        # - API tells us WHICH lap the winner finished on
+        # - Distance delta tells us WHEN the leader crossed the line
         leader_code = max(
             frame["drivers"],
             key=lambda c: (frame["drivers"][c].get("lap", 1), frame["drivers"][c].get("dist", 0))
         )
         leader_dist = frame["drivers"][leader_code].get("dist", 0)
+        leader_lap = frame["drivers"][leader_code].get("lap", 1)
         self.leader_dist_cache.append(leader_dist)
 
         # Keep only last 10 values
         if len(self.leader_dist_cache) > 10:
             self.leader_dist_cache.pop(0)
 
-        # If leader's distance hasn't changed for 2+ frames, race is finished
-        if len(self.leader_dist_cache) >= 2:
-            recent_dists = self.leader_dist_cache[-2:]
-            if abs(recent_dists[1] - recent_dists[0]) < 1.0:
-                if not self.race_finished:
-                    self.race_finished = True
-                    # Mark leader as finished first
-                    self.driver_finished_status[leader_code] = True
-                    self.driver_finish_order[leader_code] = int(self.frame_index)
+        # Check if leader has finished based on API data
+        if has_api_data and not self.race_finished:
+            leader_info = self.driver_status.get(leader_code, {})
+            leader_final_laps = leader_info.get('laps_completed', 999)
 
-        # 2c. Mark drivers as finished when they cross the line (race_finished = True)
+            # Leader has completed all laps - now wait for distance to stop increasing
+            if leader_lap >= leader_final_laps:
+                if len(self.leader_dist_cache) >= 2:
+                    recent_dists = self.leader_dist_cache[-2:]
+                    # Distance stopped = crossed finish line
+                    if abs(recent_dists[1] - recent_dists[0]) < 1.0:
+                        self.race_finished = True
+                        self.driver_finished_status[leader_code] = True
+                        self.driver_finish_order[leader_code] = int(self.frame_index)
+
+        # 2c. Mark other drivers as finished when they cross the line
         if self.race_finished:
             for code, pos in frame["drivers"].items():
-                # Only mark as finished if they haven't DNF'd and not already finished
-                if code not in self.driver_dnf_status or not self.driver_dnf_status[code]:
-                    if code not in self.driver_finished_status or not self.driver_finished_status[code]:
-                        # Check if their distance has stopped increasing (crossed finish line)
-                        if code in self.driver_dist_cache and len(self.driver_dist_cache[code]) >= 2:
+                driver_info = self.driver_status.get(code, {})
+                is_finished_per_api = driver_info.get('is_finished', False)
+                is_dnf = self.driver_dnf_status.get(code, False)
+
+                # Only process drivers who finished according to API and haven't DNF'd
+                if is_finished_per_api and not is_dnf:
+                    if code not in self.driver_finished_status:
+                        # Check if their distance stopped increasing (crossed finish line)
+                        if len(self.driver_dist_cache[code]) >= 2:
                             recent_dists = self.driver_dist_cache[code][-2:]
                             if abs(recent_dists[-1] - recent_dists[-2]) < 1.0:
                                 self.driver_finished_status[code] = True
                                 self.driver_finish_order[code] = int(self.frame_index)
 
-        # 2d. Calculate final positions using F1 rules when race is finished
+        # 2d. Calculate final positions using F1 rules (Hybrid API + Live data)
         if self.race_finished:
             classification_list = []
             for code, pos in frame["drivers"].items():
-                laps_completed = pos.get("lap", 1)
+                # Use API lap count if available, otherwise use current lap
+                driver_info = self.driver_status.get(code, {})
+                laps_completed = driver_info.get('laps_completed', pos.get("lap", 1))
+
                 crossing_order = self.driver_finish_order.get(code, 999999)
                 is_dnf = self.driver_dnf_status.get(code, False)
 
@@ -542,10 +568,14 @@ class F1ReplayWindow(arcade.Window):
 
             # DNF drivers show only status and last recorded lap
             if is_dnf:
-                current_lap = driver_pos.get("lap", 1)
+                # Get detailed status from API if available
+                driver_info = self.driver_status.get(self.selected_driver, {})
+                status_detail = driver_info.get('status', 'DNF')
+                laps_completed = driver_info.get('laps_completed', driver_pos.get("lap", 1))
+
                 stats_lines = [
-                    f"Status: DNF",
-                    f"Last Lap: {current_lap}"
+                    f"Status: {status_detail}",
+                    f"Laps: {laps_completed}"
                 ]
                 for i, line in enumerate(stats_lines):
                     arcade.Text(
