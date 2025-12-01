@@ -2,6 +2,7 @@ import os
 import arcade
 import numpy as np
 from src.f1_data import FPS
+from src.leaderboard_verifier import verify_and_correct_final_positions
 
 # Kept these as "default" starting sizes, but they are no longer hard limits
 SCREEN_WIDTH = 1920
@@ -41,7 +42,8 @@ def build_track_from_example_lap(example_lap, track_width=200):
 
 class F1ReplayWindow(arcade.Window):
     def __init__(self, frames, track_statuses, example_lap, drivers, title,
-                 playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None, penalties=None):
+                 playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None, penalties=None,
+                 year=None, round_number=None):
         # Set resizable to True so the user can adjust mid-sim
         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
 
@@ -57,6 +59,10 @@ class F1ReplayWindow(arcade.Window):
         self.frame_index = 0.0  # use float for fractional-frame accumulation
         self.paused = False
         self._tyre_textures = {}
+
+        # Store year and round for leaderboard verification
+        self.year = year
+        self.round_number = round_number
 
         # Debug: Print if we have pre-computed data
         if self.driver_status:
@@ -128,6 +134,7 @@ class F1ReplayWindow(arcade.Window):
         self.race_finished = False  # Global flag for when leader finishes
         self.leader_dist_cache = []  # Track leader's recent dist values
         self.final_positions = {}  # {driver_code: final_position} - locked after race finish
+        self.leaderboard_verified = False  # Flag to track if API verification has been performed
 
     def _interpolate_points(self, xs, ys, interp_points=2000):
         """Generates smooth points in WORLD coordinates."""
@@ -313,6 +320,21 @@ class F1ReplayWindow(arcade.Window):
                 else:
                     # DNF driver - use their position in the sorted list (after all finishers)
                     self.final_positions[driver['code']] = idx + 1
+
+        # 2e. Verify and correct final leaderboard using Jolpica F1 API
+        # This happens AFTER all drivers have finished and telemetry processing is complete
+        if self.race_finished and self.final_positions and not self.leaderboard_verified:
+            # Check if we have year and round_number for API verification
+            if self.year is not None and self.round_number is not None:
+                # Check if we're near the end of the race (last 100 frames)
+                # This ensures all drivers have been properly processed
+                if self.frame_index >= self.n_frames - 100:
+                    self.final_positions = verify_and_correct_final_positions(
+                        self.final_positions,
+                        self.year,
+                        self.round_number
+                    )
+                    self.leaderboard_verified = True
         # 3. Track Status and Drawing
         current_time = frame["t"]
         current_track_status = "GREEN"
@@ -762,7 +784,7 @@ class F1ReplayWindow(arcade.Window):
         else:
             self.selected_driver = new_selection
 
-def run_arcade_replay(frames, track_statuses, example_lap, drivers, title, playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None, penalties=None):
+def run_arcade_replay(frames, track_statuses, example_lap, drivers, title, playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None, penalties=None, year=None, round_number=None):
     window = F1ReplayWindow(
         frames=frames,
         track_statuses=track_statuses,
@@ -773,6 +795,8 @@ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title, playb
         driver_status=driver_status,
         penalties=penalties,
         driver_finish_frames=driver_finish_frames,
-        title=title
+        title=title,
+        year=year,
+        round_number=round_number
     )
     arcade.run()

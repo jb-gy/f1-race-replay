@@ -30,7 +30,9 @@ def main(year=None, round_number=None, playback_speed=1):
     driver_status=race_telemetry.get('driver_status', {}),
     driver_finish_frames=race_telemetry.get('driver_finish_frames', {}),
     penalties=race_telemetry.get('penalties', []),
-    title=f"{session.event['EventName']} - Race"
+    title=f"{session.event['EventName']} - Race",
+    year=year,
+    round_number=round_number
   )
 
 if __name__ == "__main__":
