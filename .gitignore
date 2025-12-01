@@ -10,3 +10,4 @@ computed_data/
 
 .DS_Store
 .venv
+.claude

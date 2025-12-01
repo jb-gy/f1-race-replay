@@ -112,7 +112,6 @@ if is_dnf_per_api and code not in self.driver_dnf_status:
 
 #### 2. Race Finish Detection (Hybrid)
 
-**Leader Finish Detection:**
 ```python
 # API tells us WHICH lap the winner finished on
 leader_info = self.driver_status.get(leader_code, {})
@@ -131,36 +130,11 @@ if leader_lap >= leader_final_laps:
             self.driver_finish_order[leader_code] = int(self.frame_index)
 ```
 
-**Individual Driver Finish Detection (Including Lapped Drivers):**
-```python
-# Each driver finishes when THEY complete THEIR final lap
-for code, pos in frame["drivers"].items():
-    driver_info = self.driver_status.get(code, {})
-    is_finished_per_api = driver_info.get('is_finished', False)
-    is_dnf = self.driver_dnf_status.get(code, False)
-
-    current_lap = pos.get("lap", 1)
-    driver_final_laps = driver_info.get('laps_completed', 999)
-
-    # Only process drivers who finished according to API and haven't DNF'd
-    if is_finished_per_api and not is_dnf:
-        if code not in self.driver_finished_status:
-            # Mark as finished when they've completed their final lap AND distance stops
-            if current_lap >= driver_final_laps:
-                if len(self.driver_dist_cache[code]) >= 2:
-                    recent_dists = self.driver_dist_cache[code][-2:]
-                    # Distance stopped = crossed finish line on their final lap
-                    if abs(recent_dists[-1] - recent_dists[-2]) < 1.0:
-                        self.driver_finished_status[code] = True
-                        self.driver_finish_order[code] = int(self.frame_index)
-```
-
 **Key Benefits:**
 - **No premature flags**: Only monitors for finish after API confirms correct lap
-- **Frame-accurate crossing**: Detects the exact frame when each driver crosses the line
-- **Proper chequered flag timing**: Flags appear at the moment of crossing, not when leader finishes
-- **Lapped drivers handled correctly**: A driver 1 lap down gets flagged when THEY cross the line on their final lap, not when the leader finishes
-- **Prevents false positives at race start**: Won't trigger until each driver reaches their final lap
+- **Frame-accurate crossing**: Detects the exact frame when leader crosses the line
+- **Proper chequered flag timing**: Flags appear at the moment of crossing, not one lap early
+- **Prevents false positives at race start**: Won't trigger until leader reaches final lap
 
 ---
 
@@ -230,32 +204,13 @@ if is_dnf:
                 arcade.color.RED, 14, bold=True,
                 anchor_x="center", anchor_y="top").draw()
 
-# Finish Status Indicator
-elif is_finished:
-    # Check if driver is lapped (completed fewer laps than leader)
-    driver_info = self.driver_status.get(code, {})
-    driver_laps = driver_info.get('laps_completed', pos.get("lap", 0))
-
-    # Get leader's lap count from driver_status_map
-    leader_laps = max(
-        info.get('laps_completed', 0)
-        for info in self.driver_status.values()
-    )
-
-    lap_difference = leader_laps - driver_laps
-
-    if lap_difference > 0:
-        # Display lap difference for lapped drivers (e.g., "+1 Lap", "+2 Laps")
-        lap_text = f"+{lap_difference} Lap" if lap_difference == 1 else f"+{lap_difference} Laps"
-        arcade.Text(lap_text, status_icon_x - 10, top_y,
-                    arcade.color.LIGHT_GRAY, 12,
-                    anchor_x="right", anchor_y="top").draw()
-    elif self.chequered_flag_icon:
-        # Chequered flag icon for drivers who finished on the lead lap
-        rect = arcade.XYWH(status_icon_x, status_icon_y, icon_size, icon_size)
-        arcade.draw_texture_rect(rect=rect,
-                                texture=self.chequered_flag_icon,
-                                angle=0, alpha=255)
+# Finish Status Indicator (higher priority than DNF)
+elif is_finished and self.chequered_flag_icon:
+    # Chequered flag icon
+    rect = arcade.XYWH(status_icon_x, status_icon_y, icon_size, icon_size)
+    arcade.draw_texture_rect(rect=rect,
+                            texture=self.chequered_flag_icon,
+                            angle=0, alpha=255)
 
 # Normal racing (tire icon)
 else:
@@ -265,14 +220,9 @@ else:
 
 **Priority hierarchy:**
 1. DNF drivers show red "DNF" text
-2. Lapped finished drivers show "+N Lap(s)" text in gray
+2. Lapped finished drivers show "+N Lap(s)" text in gray + chequered flag
 3. Lead lap finished drivers show chequered flag 🏁
 4. Racing drivers show tire compound icon
-
-**Lap Difference Display:**
-- Automatically calculates lap deficit by comparing each driver's completed laps to the leader's
-- Displays "+1 Lap" for drivers one lap down, "+2 Laps" for two laps down, etc.
-- Matches official F1 results format (e.g., US Grand Prix results show "Finished +1 Lap")
 
 ---
 
@@ -323,10 +273,9 @@ def get_race_telemetry(session):
             laps_completed = driver_result.get('Laps', 0)
 
             # Determine if driver finished normally or DNF'd
-            # A driver "finished" if they completed the race, even if lapped
-            is_finished = 'Finished' in str(status) or '+' in str(status) or 'Lap' in str(status)
-            # DNF only if classified as R/D/E/W/N (Retired, Disqualified, Excluded, Withdrawn, Not classified)
-            is_dnf = classification in ['R', 'D', 'E', 'W', 'N']
+            is_finished = 'Finished' in str(status) or '+' in str(status)
+            is_dnf = classification in ['R', 'D', 'E', 'W', 'N'] or \
+                     (not is_finished and laps_completed > 0)
 
             driver_status_map[code] = {
                 'status': str(status),
@@ -407,107 +356,64 @@ def on_update(self, delta_time):
 ---
 
 
-## References
+## Recent Updates (December 2025)
 
-- [FastF1 Documentation](https://docs.fastf1.dev/)
-- [Python Arcade Library](https://api.arcade.academy/)
-- [FIA F1 Sporting Regulations](https://www.fia.com/regulation/category/110) (Classification rules)
+### Chequered Flag Icon and Lap Difference Display
 
----
+**Added**: Visual indicators for finished drivers
 
-## Bug Fix: Lapped Drivers Incorrectly Shown as DNF
+**Changes**:
+- **Chequered flag icon**: Displayed for all finished drivers (lead lap and lapped)
+- **Lap difference text**: Shows "+1 Lap", "+2 Laps", etc. for lapped finishers
+- **Combined display**: Lapped drivers show both flag icon AND lap text
 
-### The Problem (December 2025)
-
-During testing with the 2025 US Grand Prix, a critical bug was discovered:
-
-**Symptoms:**
-1. Drivers who finished "+1 Lap" or "+2 Laps" behind were incorrectly displayed as "DNF"
-2. Chequered flags appeared too early - lapped drivers received flags when the leader finished, not when they crossed the line
-3. Final leaderboard didn't match official F1 results
-
-**Example from US GP:**
-- Real results: Colapinto finished "+1 Lap" (P17), Bortoleto "+1 Lap" (P18), Gasly "+1 Lap" (P19)
-- App showed: All three as "DNF" with red text
-- App behavior: All three received chequered flags when Verstappen (leader) finished, not when they finished
-
-### Root Causes
-
-**1. Incorrect DNF Detection Logic ([src/f1_data.py:76-77](src/f1_data.py#L76-L77))**
+**Implementation** ([src/arcade_replay.py:509-531](src/arcade_replay.py#L509-L531)):
 ```python
-# OLD BROKEN CODE:
-is_finished = 'Finished' in str(status) or '+' in str(status)
-is_dnf = classification in ['R', 'D', 'E', 'W', 'N'] or (not is_finished and laps_completed > 0)
-```
-Problem: The second condition `(not is_finished and laps_completed > 0)` was too broad. It marked any driver who didn't finish on the lead lap as DNF, even if they completed the race while lapped.
-
-**2. Race-Based Finish Detection ([src/arcade_replay.py:258](src/arcade_replay.py#L258))**
-```python
-# OLD BROKEN CODE:
-# 2c. Mark other drivers as finished when they cross the line
-if self.race_finished:  # ← BUG: Only checks after leader finishes
-    for code, pos in frame["drivers"].items():
-        # ... marks ALL finished drivers immediately
-```
-Problem: Once `self.race_finished = True` (when leader finishes), the code immediately started checking ALL drivers marked as `is_finished` and gave them flags as soon as their distance stopped increasing. But a lapped driver on lap 55 (when leader finishes lap 57) should NOT get a flag yet.
-
-**3. Missing Lap Difference Display**
-The leaderboard had no code to display "+1 Lap", "+2 Laps", etc. - it only showed DNF text or chequered flag.
-
-### The Fix
-
-**1. Fixed DNF Detection ([src/f1_data.py:76-79](src/f1_data.py#L76-L79))**
-```python
-# NEW FIXED CODE:
-is_finished = 'Finished' in str(status) or '+' in str(status) or 'Lap' in str(status)
-is_dnf = classification in ['R', 'D', 'E', 'W', 'N']  # Only actual retirements
-```
-Now only drivers with official retirement classifications (R/D/E/W/N) are marked as DNF. Lapped drivers are correctly marked as `is_finished = True`.
-
-**2. Fixed Finish Frame Detection ([src/arcade_replay.py:257-276](src/arcade_replay.py#L257-L276))**
-```python
-# NEW FIXED CODE:
-# 2c. Mark other drivers as finished when they complete THEIR final lap
-for code, pos in frame["drivers"].items():  # No longer gated by race_finished
-    current_lap = pos.get("lap", 1)
-    driver_final_laps = driver_info.get('laps_completed', 999)
-
-    if is_finished_per_api and not is_dnf:
-        if code not in self.driver_finished_status:
-            # Mark as finished when THEY complete THEIR final lap
-            if current_lap >= driver_final_laps:  # ← KEY FIX
-                if len(self.driver_dist_cache[code]) >= 2:
-                    recent_dists = self.driver_dist_cache[code][-2:]
-                    if abs(recent_dists[-1] - recent_dists[-2]) < 1.0:
-                        self.driver_finished_status[code] = True
-```
-Now each driver gets their flag only when THEY complete THEIR final lap, regardless of when the leader finished.
-
-**3. Added Lap Difference Display ([src/arcade_replay.py:482-516](src/arcade_replay.py#L482-L516))**
-```python
-# NEW CODE:
-elif is_finished:
+if is_finished:
     driver_laps = driver_info.get('laps_completed', pos.get("lap", 0))
     leader_laps = max(info.get('laps_completed', 0) for info in self.driver_status.values())
     lap_difference = leader_laps - driver_laps
 
     if lap_difference > 0:
-        # Display "+1 Lap", "+2 Laps", etc.
+        # Display "+1 Lap", "+2 Laps" text
         lap_text = f"+{lap_difference} Lap" if lap_difference == 1 else f"+{lap_difference} Laps"
-        arcade.Text(lap_text, ...).draw()
-    elif self.chequered_flag_icon:
-        # Show flag only for lead lap finishers
-        arcade.draw_texture_rect(..., texture=self.chequered_flag_icon, ...)
+
+        # Draw chequered flag icon
+        if self.chequered_flag_icon:
+            arcade.draw_texture_rect(rect=rect, texture=self.chequered_flag_icon, ...)
+
+        # Draw lap difference text to the left of the flag
+        arcade.Text(lap_text, ..., arcade.color.LIGHT_GRAY, ...).draw()
+    else:
+        # Lead lap finishers: show flag only
+        arcade.draw_texture_rect(rect=rect, texture=self.chequered_flag_icon, ...)
 ```
 
-### Verification
+**Asset**: Chequered flag loaded from [images/flags/chequered_flag.png](images/flags/chequered_flag.png)
 
-After the fix, US Grand Prix results match official F1 data:
-- Colapinto (P17): Shows "+1 Lap" ✅
-- Bortoleto (P18): Shows "+1 Lap" ✅
-- Gasly (P19): Shows "+1 Lap" ✅
-- Sainz (P20): Shows "DNF" (actual retirement) ✅
-- Chequered flags appear only when each driver crosses the line on their final lap ✅
+### Leaderboard Verification System
+
+**Added**: Automatic position correction after race ends
+
+After the race finishes and all drivers are processed, the system now:
+1. Fetches official results from Jolpica F1 API
+2. Compares telemetry-based positions with official FIA results
+3. Corrects any discrepancies automatically
+
+See [LEADERBOARD_VERIFICATION.md](LEADERBOARD_VERIFICATION.md) for full details.
+
+**Key files**:
+- New module: [src/leaderboard_verifier.py](src/leaderboard_verifier.py)
+- Integration: [src/arcade_replay.py:324-337](src/arcade_replay.py#L324-L337)
+
+---
+
+## References
+
+- [FastF1 Documentation](https://docs.fastf1.dev/)
+- [Python Arcade Library](https://api.arcade.academy/)
+- [FIA F1 Sporting Regulations](https://www.fia.com/regulation/category/110) (Classification rules)
+- [Jolpica F1 API](https://github.com/jolpica/jolpica-f1) (Leaderboard verification)
 
 ---
 
