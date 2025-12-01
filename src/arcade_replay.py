@@ -41,7 +41,7 @@ def build_track_from_example_lap(example_lap, track_width=200):
 
 class F1ReplayWindow(arcade.Window):
     def __init__(self, frames, track_statuses, example_lap, drivers, title,
-                 playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None):
+                 playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None, penalties=None):
         # Set resizable to True so the user can adjust mid-sim
         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
 
@@ -53,6 +53,7 @@ class F1ReplayWindow(arcade.Window):
         self.driver_colors = driver_colors or {}
         self.driver_status = driver_status or {}  # Pre-computed driver status from session.results
         self.driver_finish_frames = driver_finish_frames or {}  # Frame when each driver finished
+        self.penalties = penalties or []  # List of penalties from race control
         self.frame_index = 0.0  # use float for fractional-frame accumulation
         self.paused = False
         self._tyre_textures = {}
@@ -254,49 +255,57 @@ class F1ReplayWindow(arcade.Window):
                         self.driver_finished_status[leader_code] = True
                         self.driver_finish_order[leader_code] = int(self.frame_index)
 
-        # 2c. Mark other drivers as finished when they cross the line
-        if self.race_finished:
-            for code, pos in frame["drivers"].items():
-                driver_info = self.driver_status.get(code, {})
-                is_finished_per_api = driver_info.get('is_finished', False)
-                is_dnf = self.driver_dnf_status.get(code, False)
+        # 2c. Mark other drivers as finished when they complete THEIR final lap
+        for code, pos in frame["drivers"].items():
+            driver_info = self.driver_status.get(code, {})
+            is_finished_per_api = driver_info.get('is_finished', False)
+            is_dnf = self.driver_dnf_status.get(code, False)
 
-                # Only process drivers who finished according to API and haven't DNF'd
-                if is_finished_per_api and not is_dnf:
-                    if code not in self.driver_finished_status:
-                        # Check if their distance stopped increasing (crossed finish line)
+            current_lap = pos.get("lap", 1)
+            driver_final_laps = driver_info.get('laps_completed', 999)
+
+            # Only process drivers who finished according to API and haven't DNF'd
+            if is_finished_per_api and not is_dnf:
+                if code not in self.driver_finished_status:
+                    # Mark as finished when they've completed their final lap AND distance stops increasing
+                    if current_lap >= driver_final_laps:
                         if len(self.driver_dist_cache[code]) >= 2:
                             recent_dists = self.driver_dist_cache[code][-2:]
+                            # Distance stopped = crossed finish line on their final lap
                             if abs(recent_dists[-1] - recent_dists[-2]) < 1.0:
                                 self.driver_finished_status[code] = True
                                 self.driver_finish_order[code] = int(self.frame_index)
 
-        # 2d. Calculate final positions using F1 rules (Hybrid API + Live data)
-        if self.race_finished:
-            classification_list = []
-            for code, pos in frame["drivers"].items():
-                # Use API lap count if available, otherwise use current lap
+        # 2d. Use official API classification positions
+        if self.race_finished and not self.final_positions:
+            # Use the official classification from the API (already accounts for penalties)
+            # Only compute this once when race finishes
+            temp_classification = []
+            for code in frame["drivers"].keys():
                 driver_info = self.driver_status.get(code, {})
-                laps_completed = driver_info.get('laps_completed', pos.get("lap", 1))
+                api_classification = driver_info.get('classification', 99)
+                laps_completed = driver_info.get('laps_completed', 0)
 
-                crossing_order = self.driver_finish_order.get(code, 999999)
-                is_dnf = self.driver_dnf_status.get(code, False)
+                # Convert classification to sortable value
+                if isinstance(api_classification, int):
+                    sort_key = api_classification
+                else:
+                    # DNF drivers - sort after all finishers by laps completed (descending)
+                    sort_key = 1000 - laps_completed
 
-                classification_list.append({
-                    "code": code,
-                    "laps": laps_completed,
-                    "crossing_order": crossing_order,
-                    "is_dnf": is_dnf,
-                    "dist": pos.get("dist", 0)
+                temp_classification.append({
+                    'code': code,
+                    'position': api_classification if isinstance(api_classification, int) else api_classification,
+                    'sort_key': sort_key
                 })
 
-            # F1 Classification: Laps (desc), Crossing order (asc), Distance (desc)
-            classification_list.sort(key=lambda x: (-x["laps"], x["crossing_order"], -x["dist"]))
+            # Sort by sort_key to get final order
+            temp_classification.sort(key=lambda x: x['sort_key'])
 
-            # Assign final positions
+            # Assign display positions (1, 2, 3, ... 20)
             self.final_positions = {}
-            for idx, driver_data in enumerate(classification_list):
-                self.final_positions[driver_data["code"]] = idx + 1
+            for idx, driver_data in enumerate(temp_classification):
+                self.final_positions[driver_data['code']] = idx + 1
         # 3. Track Status and Drawing
         current_time = frame["t"]
         current_track_status = "GREEN"
@@ -475,15 +484,54 @@ class F1ReplayWindow(arcade.Window):
                     bold=True,
                     anchor_x="center", anchor_y="top"
                 ).draw()
-            elif is_finished and self.chequered_flag_icon:
-                # Display chequered flag icon for finished drivers
-                rect = arcade.XYWH(status_icon_x, status_icon_y, icon_size, icon_size)
-                arcade.draw_texture_rect(
-                    rect=rect,
-                    texture=self.chequered_flag_icon,
-                    angle=0,
-                    alpha=255
-                )
+            elif is_finished:
+                # Check if driver is lapped (completed fewer laps than leader)
+                driver_info = self.driver_status.get(code, {})
+                driver_laps = driver_info.get('laps_completed', pos.get("lap", 0))
+
+                # Get leader's lap count from driver_status_map
+                leader_laps = 0
+                for leader_code, leader_pos in frame["drivers"].items():
+                    leader_info = self.driver_status.get(leader_code, {})
+                    leader_candidate_laps = leader_info.get('laps_completed', 0)
+                    if leader_candidate_laps > leader_laps:
+                        leader_laps = leader_candidate_laps
+
+                lap_difference = leader_laps - driver_laps
+
+                if lap_difference > 0:
+                    # Display lap difference AND chequered flag for lapped drivers
+                    lap_text = f"+{lap_difference} Lap" if lap_difference == 1 else f"+{lap_difference} Laps"
+
+                    # Draw chequered flag icon
+                    if self.chequered_flag_icon:
+                        rect = arcade.XYWH(status_icon_x, status_icon_y, icon_size, icon_size)
+                        arcade.draw_texture_rect(
+                            rect=rect,
+                            texture=self.chequered_flag_icon,
+                            angle=0,
+                            alpha=255
+                        )
+
+                    # Draw lap difference text to the left of the flag
+                    arcade.Text(
+                        lap_text,
+                        status_icon_x - 45,
+                        top_y,
+                        arcade.color.LIGHT_GRAY,
+                        12,
+                        anchor_x="right", anchor_y="top"
+                    ).draw()
+                else:
+                    # Display chequered flag icon only for drivers who finished on the lead lap
+                    if self.chequered_flag_icon:
+                        rect = arcade.XYWH(status_icon_x, status_icon_y, icon_size, icon_size)
+                        arcade.draw_texture_rect(
+                            rect=rect,
+                            texture=self.chequered_flag_icon,
+                            angle=0,
+                            alpha=255
+                        )
             else:
                 # Display tyre icon for drivers still racing
                 tyre_texture = self._tyre_textures.get(str(pos.get("tyre", "?")).upper())
@@ -616,7 +664,56 @@ class F1ReplayWindow(arcade.Window):
                         14,
                         anchor_x="left", anchor_y="center"
                     ).draw()
-                    
+
+        # Penalties section (bottom right corner) - only show after race finishes
+        if self.penalties and self.race_finished:
+            penalty_x = self.width - 280
+            penalty_y = 180
+            penalty_box_width = 260
+            penalty_box_height = min(150, 30 + len(self.penalties) * 25)
+
+            # Title
+            arcade.Text(
+                "Penalties",
+                penalty_x,
+                penalty_y,
+                arcade.color.WHITE,
+                18,
+                bold=True,
+                anchor_x="left",
+                anchor_y="top"
+            ).draw()
+
+            # List penalties
+            for i, penalty in enumerate(self.penalties):
+                driver_code = penalty.get('driver', '???')
+                penalty_type = penalty.get('type', 'Unknown')
+                driver_color = self.driver_colors.get(driver_code, arcade.color.WHITE)
+
+                # Draw driver code in their team color
+                y_pos = penalty_y - 30 - (i * 25)
+                arcade.Text(
+                    driver_code,
+                    penalty_x,
+                    y_pos,
+                    driver_color,
+                    14,
+                    bold=True,
+                    anchor_x="left",
+                    anchor_y="top"
+                ).draw()
+
+                # Draw penalty type
+                arcade.Text(
+                    penalty_type,
+                    penalty_x + 50,
+                    y_pos,
+                    arcade.color.ORANGE,
+                    14,
+                    anchor_x="left",
+                    anchor_y="top"
+                ).draw()
+
     def on_update(self, delta_time: float):
         if self.paused:
             return
@@ -658,7 +755,7 @@ class F1ReplayWindow(arcade.Window):
         else:
             self.selected_driver = new_selection
 
-def run_arcade_replay(frames, track_statuses, example_lap, drivers, title, playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None):
+def run_arcade_replay(frames, track_statuses, example_lap, drivers, title, playback_speed=1.0, driver_colors=None, driver_status=None, driver_finish_frames=None, penalties=None):
     window = F1ReplayWindow(
         frames=frames,
         track_statuses=track_statuses,
@@ -667,6 +764,7 @@ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title, playb
         playback_speed=playback_speed,
         driver_colors=driver_colors,
         driver_status=driver_status,
+        penalties=penalties,
         driver_finish_frames=driver_finish_frames,
         title=title
     )

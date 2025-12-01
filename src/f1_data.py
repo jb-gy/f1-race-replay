@@ -73,8 +73,10 @@ def get_race_telemetry(session):
             laps_completed = driver_result.get('Laps', 0)
 
             # Determine if driver finished normally or DNF'd
-            is_finished = 'Finished' in str(status) or '+' in str(status)
-            is_dnf = classification in ['R', 'D', 'E', 'W', 'N'] or (not is_finished and laps_completed > 0)
+            # A driver "finished" if they completed the race, even if lapped
+            is_finished = 'Finished' in str(status) or '+' in str(status) or 'Lap' in str(status)
+            # DNF only if classified as R/D/E/W/N (Retired, Disqualified, Excluded, Withdrawn, Not classified)
+            is_dnf = classification in ['R', 'D', 'E', 'W', 'N']
 
             driver_status_map[code] = {
                 'status': str(status),
@@ -85,6 +87,57 @@ def get_race_telemetry(session):
             }
 
     print(f"Driver status extracted for {len(driver_status_map)} drivers")
+
+    # Extract penalty information from race control messages
+    print("Extracting penalty information...")
+    penalties = []
+    race_control_msgs = session.race_control_messages
+
+    # Look for penalty-related messages
+    penalty_keywords = ['PENALTY', 'PENALISED', 'PENALIZED']
+    for _, msg_row in race_control_msgs.iterrows():
+        message = str(msg_row.get('Message', ''))
+        for keyword in penalty_keywords:
+            if keyword in message.upper() and 'SERVED' not in message.upper():
+                # Parse penalty information
+                # Example: "FIA STEWARDS: 5 SECOND TIME PENALTY FOR CAR 5 (BOR) - UNSAFE RELEASE"
+                try:
+                    # Extract driver code (looks for pattern like "CAR X (CODE)")
+                    import re
+                    car_match = re.search(r'CAR\s+\d+\s+\(([A-Z]{3})\)', message)
+                    if car_match:
+                        driver_code = car_match.group(1)
+
+                        # Extract penalty type
+                        penalty_type = "Unknown"
+                        if "TIME PENALTY" in message.upper():
+                            time_match = re.search(r'(\d+)\s+SECOND', message.upper())
+                            if time_match:
+                                penalty_type = f"+{time_match.group(1)}s"
+                        elif "POSITION" in message.upper():
+                            pos_match = re.search(r'(\d+)\s+POSITION', message.upper())
+                            if pos_match:
+                                penalty_type = f"-{pos_match.group(1)} pos"
+                        elif "DISQUALIF" in message.upper():
+                            penalty_type = "DSQ"
+                        elif "REPRIMAND" in message.upper():
+                            penalty_type = "Reprimand"
+
+                        # Extract reason (text after the dash)
+                        reason = "N/A"
+                        if " - " in message:
+                            reason = message.split(" - ", 1)[1].strip()
+
+                        penalties.append({
+                            'driver': driver_code,
+                            'type': penalty_type,
+                            'reason': reason
+                        })
+                except Exception as e:
+                    print(f"Error parsing penalty message: {e}")
+                break
+
+    print(f"Found {len(penalties)} penalties")
 
     driver_data = {}
 
@@ -377,6 +430,7 @@ def get_race_telemetry(session):
             "track_statuses": formatted_track_statuses,
             "driver_status": driver_status_map,
             "driver_finish_frames": driver_finish_frame,
+            "penalties": penalties,
         }, f, indent=2)
 
     print("Saved Successfully!")
@@ -387,4 +441,5 @@ def get_race_telemetry(session):
         "track_statuses": formatted_track_statuses,
         "driver_status": driver_status_map,
         "driver_finish_frames": driver_finish_frame,
+        "penalties": penalties,
     }
